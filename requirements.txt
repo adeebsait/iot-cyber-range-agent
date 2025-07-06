@@ -1,6 +1,8 @@
-pandas
-numpy
-scikit-learn
-scapy
-joblib
+pandas~=2.3.0
+numpy~=2.3.1
+scikit-learn~=1.7.0
+scapy~=2.6.1
+joblib~=1.5.1
 matplotlib
+
+tqdm~=4.67.1

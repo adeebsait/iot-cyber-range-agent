@@ -15,15 +15,15 @@ DATA_STREAM  = os.path.join(ROOT, 'data', 'stream.csv')
 MODEL_DIR    = os.path.join(ROOT, 'models')
 LOG_FILE     = os.path.join(ROOT, 'logs', 'alerts.log')
 
-# Clear previous log
+# Clear previous run's log
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 open(LOG_FILE, 'w').close()
 
-# ─── FLASK / SOCKET.IO ────────────────────────────────────────────────────────────
+# ─── FLASK & SOCKET.IO SETUP ─────────────────────────────────────────────────────
 app = Flask(__name__, template_folder=TEMPLATE_DIR)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# ─── LOAD MODELS ──────────────────────────────────────────────────────────────────
+# ─── LOAD YOUR MODELS ─────────────────────────────────────────────────────────────
 MODELS = {
     "RF":       joblib.load(os.path.join(MODEL_DIR, "Random_Forest.pkl")),
     "KNN":      joblib.load(os.path.join(MODEL_DIR, "KNN_(k=5).pkl")),
@@ -50,7 +50,7 @@ def load_past_alerts():
                     continue
     return alerts
 
-# ─── ROUTE: main page ─────────────────────────────────────────────────────────────
+# ─── ROUTE: serve dashboard ───────────────────────────────────────────────────────
 @app.route('/')
 def index():
     past_alerts = load_past_alerts()
@@ -64,7 +64,7 @@ def index():
         init_summary = json.dumps(summary)
     )
 
-# ─── WORKER: detection ─────────────────────────────────────────────────────────────
+# ─── WORKER: detect & emit ────────────────────────────────────────────────────────
 def detect(queue: Queue):
     global ensemble_alert_counter
     feature_cols = list(next(iter(MODELS.values())).feature_names_in_)
@@ -72,16 +72,14 @@ def detect(queue: Queue):
     while True:
         msg = queue.get()
         if msg is None:
-            # end-of-stream summary
-            socketio.emit(
-                'run_summary',
-                {'model_votes': model_vote_counters,
-                 'total_alerts': ensemble_alert_counter},
-                broadcast=True
-            )
+            # send end-of-run summary
+            socketio.emit('run_summary', {
+                'model_votes':   model_vote_counters,
+                'total_alerts':  ensemble_alert_counter
+            })
             break
 
-        # drop synthetic keys
+        # strip synthetic keys
         msg.pop('time_ms', None)
         msg.pop('label',   None)
 
@@ -94,19 +92,20 @@ def detect(queue: Queue):
             votes[name] = pred
             model_vote_counters[name] += pred
 
-        if sum(votes.values()) >= (len(votes)/2):
+        if sum(votes.values()) >= (len(votes) / 2):
             ensemble_alert_counter += 1
             alert = {
                 'time':   time.strftime("%H:%M:%S"),
                 'src_ip': msg.get('src_ip','<unknown>'),
                 'votes':  votes
             }
-            # immediate broadcast + log
-            socketio.emit('new_alert', alert, broadcast=True)
+            # emit to all clients
+            socketio.emit('new_alert', alert)
+            # append to log
             with open(LOG_FILE, 'a') as f:
                 f.write(json.dumps(alert) + "\n")
 
-# ─── WORKER: tail the log ──────────────────────────────────────────────────────────
+# ─── WORKER: tail the log (in case) ────────────────────────────────────────────────
 def tail_log():
     with open(LOG_FILE, 'r') as f:
         f.seek(0, os.SEEK_END)
@@ -119,9 +118,9 @@ def tail_log():
                 alert = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            socketio.emit('new_alert', alert, broadcast=True)
+            socketio.emit('new_alert', alert)
 
-# ─── WORKER: simulator ────────────────────────────────────────────────────────────
+# ─── WORKER: simulate live stream ─────────────────────────────────────────────────
 def simulate(queue: Queue, csv_path: str, delay: float = 0.05):
     with open(csv_path, newline='') as csvfile:
         reader = csv.DictReader(csvfile)
@@ -130,7 +129,7 @@ def simulate(queue: Queue, csv_path: str, delay: float = 0.05):
             time.sleep(delay)
     queue.put(None)
 
-# ─── MAIN ────────────────────────────────────────────────────────────────────────
+# ─── ENTRY POINT ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     q = Queue()
     Thread(target=detect,   args=(q,), daemon=True).start()

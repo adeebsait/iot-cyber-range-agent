@@ -98,6 +98,8 @@ def main(data_dir, out_dir='models'):
         df[f'Δ vs {label} (pp)'] = (df['Accuracy(%)'] / 100 - base_acc) * 100
 
     # 6. Display
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', 1000)
     pd.set_option('display.precision', 2)
     print("\n=== MODEL COMPARISON ===")
     print(df)

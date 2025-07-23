@@ -4,7 +4,11 @@ import json
 import joblib
 import csv
 from queue import Queue
-from threading import Thread
+
+# 1) Monkey-patch for eventlet
+import eventlet
+eventlet.monkey_patch()
+
 from flask import Flask, render_template
 from flask_socketio import SocketIO
 
@@ -21,9 +25,9 @@ open(LOG_FILE, 'w').close()
 
 # ─── FLASK & SOCKET.IO SETUP ─────────────────────────────────────────────────────
 app = Flask(__name__, template_folder=TEMPLATE_DIR)
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-# ─── LOAD MODELS ─────────────────────────────────────────────────────────────
+# ─── LOAD MODELS ──────────────────────────────────────────────────────────────────
 MODELS = {
     "RF":       joblib.load(os.path.join(MODEL_DIR, "Random_Forest.pkl")),
     "KNN":      joblib.load(os.path.join(MODEL_DIR, "KNN_(k=5).pkl")),
@@ -55,8 +59,8 @@ def load_past_alerts():
 def index():
     past_alerts = load_past_alerts()
     summary = {
-        'model_votes': model_vote_counters,
-        'total_alerts': len(past_alerts)
+        'model_votes':   model_vote_counters,
+        'total_alerts':  len(past_alerts)
     }
     return render_template(
         'index.html',
@@ -64,7 +68,7 @@ def index():
         init_summary = json.dumps(summary)
     )
 
-# ─── WORKER: detect & emit ────────────────────────────────────────────────────────
+# ─── WORKER: detection ─────────────────────────────────────────────────────────────
 def detect(queue: Queue):
     global ensemble_alert_counter
     feature_cols = list(next(iter(MODELS.values())).feature_names_in_)
@@ -72,14 +76,12 @@ def detect(queue: Queue):
     while True:
         msg = queue.get()
         if msg is None:
-            # send end-of-run summary
             socketio.emit('run_summary', {
                 'model_votes':   model_vote_counters,
                 'total_alerts':  ensemble_alert_counter
             })
             break
 
-        # strip synthetic keys
         msg.pop('time_ms', None)
         msg.pop('label',   None)
 
@@ -99,28 +101,13 @@ def detect(queue: Queue):
                 'src_ip': msg.get('src_ip','<unknown>'),
                 'votes':  votes
             }
-            # emit to all clients
+            # emit immediately to all clients
             socketio.emit('new_alert', alert)
             # append to log
             with open(LOG_FILE, 'a') as f:
                 f.write(json.dumps(alert) + "\n")
 
-# ─── WORKER: tail the log (in case) ────────────────────────────────────────────────
-def tail_log():
-    with open(LOG_FILE, 'r') as f:
-        f.seek(0, os.SEEK_END)
-        while True:
-            line = f.readline()
-            if not line:
-                time.sleep(0.1)
-                continue
-            try:
-                alert = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            socketio.emit('new_alert', alert)
-
-# ─── WORKER: simulate live stream ─────────────────────────────────────────────────
+# ─── WORKER: streamline CSV rows ───────────────────────────────────────────────────
 def simulate(queue: Queue, csv_path: str, delay: float = 0.05):
     with open(csv_path, newline='') as csvfile:
         reader = csv.DictReader(csvfile)
@@ -129,10 +116,11 @@ def simulate(queue: Queue, csv_path: str, delay: float = 0.05):
             time.sleep(delay)
     queue.put(None)
 
-# ─── ENTRY POINT ──────────────────────────────────────────────────────────────────
+# ─── MAIN ENTRY POINT ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     q = Queue()
-    Thread(target=detect,   args=(q,), daemon=True).start()
-    Thread(target=tail_log, daemon=True).start()
-    Thread(target=simulate, args=(q, DATA_STREAM), daemon=True).start()
+    # Start background tasks via SocketIO
+    socketio.start_background_task(simulate, q, DATA_STREAM)
+    socketio.start_background_task(detect,   q)
+    # Run the server with eventlet
     socketio.run(app, host='0.0.0.0', port=5000)

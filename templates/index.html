@@ -9,32 +9,23 @@
         font-family: Arial, sans-serif;
         max-width: 800px;
         margin: 1em auto;
-        padding: 0 1em;
       }
-      h1, h2 {
-        text-align: centre;
-      }
-      #summary, #alerts {
-        margin-top: 2em;
-      }
+      h1, h2 { text-align: centre; }
       table {
         width: 100%;
         border-collapse: collapse;
-        margin-bottom: 1em;
+        margin: 1em 0;
       }
       th, td {
         padding: 0.5em;
         border: 1px solid #ccc;
-        text-align: left;
       }
-      th {
-        background: #f7f7f7;
-      }
+      th { background: #f0f0f0; }
       .alert {
         background: #ffecec;
         border: 1px solid #f5aca6;
         border-radius: 4px;
-        padding: 0.5em;
+        padding: 0.75em;
         margin-bottom: 0.5em;
       }
     </style>
@@ -44,56 +35,59 @@
 
     <section id="summary">
       <h2>Model Vote Counters</h2>
-      <table id="summary-table">
+      <table>
         <thead>
           <tr><th>Model</th><th>Positive Votes</th></tr>
         </thead>
-        <tbody></tbody>
+        <tbody id="summary-body"></tbody>
       </table>
-      <p><strong>Total Ensemble Alerts:</strong> <span id="total-alerts">0</span></p>
+      <p><strong>Total Ensemble Alerts:</strong>
+        <span id="total-alerts">0</span>
+      </p>
     </section>
 
     <section id="alerts">
       <h2>Alert Feed</h2>
-      <!-- New alerts appear here -->
     </section>
 
     <script>
-      console.log("Dashboard loaded, connecting…");
+      // Parse the initial data passed from Flask
+      const initAlerts  = JSON.parse({{ init_alerts | safe }});
+      const initSummary = JSON.parse({{ init_summary | safe }});
+
+      const summaryBody = document.getElementById('summary-body');
+      const totalEl     = document.getElementById('total-alerts');
+      const alertsEl    = document.getElementById('alerts');
+
+      // Initialise summary table
+      for (const [model, count] of Object.entries(initSummary.model_votes)) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${model}</td><td id="count-${model}">${count}</td>`;
+        summaryBody.appendChild(tr);
+      }
+      totalEl.textContent = initSummary.total_alerts;
+
+      // Initialise alert feed
+      initAlerts.forEach(alert => {
+        const div = document.createElement('div');
+        div.className = 'alert';
+        div.textContent = `${alert.time} – ALERT from ${alert.src_ip} (votes: ${JSON.stringify(alert.votes)})`;
+        alertsEl.appendChild(div);
+      });
+
+      // Setup SocketIO
       const socket = io();
 
-      const modelVoteCounters = {};
-      const tbody = document.querySelector('#summary-table tbody');
-      const totalEl = document.getElementById('total-alerts');
-      const alertsEl = document.getElementById('alerts');
-
-      socket.on('connect', () => console.log("Socket connected"));
-      socket.on('disconnect', () => console.log("Socket disconnected"));
-
       socket.on('new_alert', data => {
-        console.log("Received alert:", data);
-
-        // Update model vote counts
-        Object.entries(data.votes).forEach(([model, vote]) => {
-          if (!(model in modelVoteCounters)) {
-            modelVoteCounters[model] = 0;
-          }
-          modelVoteCounters[model] += vote;
-
-          let row = document.getElementById('row-' + model);
-          if (!row) {
-            row = document.createElement('tr');
-            row.id = 'row-' + model;
-            row.innerHTML = `<td>${model}</td><td id="cell-${model}">0</td>`;
-            tbody.appendChild(row);
-          }
-          document.getElementById('cell-' + model).textContent = modelVoteCounters[model];
-        });
-
-        // Update total alerts
+        // Update counters
+        for (const [model, vote] of Object.entries(data.votes)) {
+          const cell = document.getElementById(`count-${model}`);
+          const newCount = parseInt(cell.textContent) + vote;
+          cell.textContent = newCount;
+        }
         totalEl.textContent = parseInt(totalEl.textContent) + 1;
 
-        // Prepend to alert feed
+        // Prepend to feed
         const div = document.createElement('div');
         div.className = 'alert';
         div.textContent = `${data.time} – ALERT from ${data.src_ip} (votes: ${JSON.stringify(data.votes)})`;
@@ -101,19 +95,11 @@
       });
 
       socket.on('run_summary', summary => {
-        console.log("Run completed:", summary);
-        // Populate summary table with final counts
-        Object.entries(summary.model_votes).forEach(([model, count]) => {
-          let row = document.getElementById('row-' + model);
-          if (!row) {
-            row = document.createElement('tr');
-            row.id = 'row-' + model;
-            row.innerHTML = `<td>${model}</td><td id="cell-${model}">${count}</td>`;
-            tbody.appendChild(row);
-          } else {
-            document.getElementById('cell-' + model).textContent = count;
-          }
-        });
+        // Finalise counters if needed
+        for (const [model, count] of Object.entries(summary.model_votes)) {
+          const cell = document.getElementById(`count-${model}`);
+          cell.textContent = count;
+        }
         totalEl.textContent = summary.total_alerts;
       });
     </script>

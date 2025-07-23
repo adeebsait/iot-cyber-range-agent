@@ -23,7 +23,7 @@ open(LOG_FILE, 'w').close()
 app = Flask(__name__, template_folder=TEMPLATE_DIR)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# ─── LOAD YOUR MODELS ─────────────────────────────────────────────────────────────
+# ─── LOAD MODELS ─────────────────────────────────────────────────────────────
 MODELS = {
     "RF":       joblib.load(os.path.join(MODEL_DIR, "Random_Forest.pkl")),
     "KNN":      joblib.load(os.path.join(MODEL_DIR, "KNN_(k=5).pkl")),

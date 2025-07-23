@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import joblib
 import pandas as pd
 from queue import Queue
@@ -15,11 +16,11 @@ DATA_STREAM  = os.path.join(ROOT, 'data', 'stream.csv')
 MODEL_DIR    = os.path.join(ROOT, 'models')
 LOG_FILE     = os.path.join(ROOT, 'logs', 'alerts.log')
 
-# Flask + SocketIO
+# Flask app
 app = Flask(__name__, template_folder=TEMPLATE_DIR)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Load trained models
+# Load models
 MODELS = {
     "RF":       joblib.load(os.path.join(MODEL_DIR, "Random_Forest.pkl")),
     "KNN":      joblib.load(os.path.join(MODEL_DIR, "KNN_(k=5).pkl")),
@@ -27,77 +28,91 @@ MODELS = {
     "LogReg":   joblib.load(os.path.join(MODEL_DIR, "Logistic_Reg.pkl")),
 }
 
-# Counters
+# Initialise counters (will be updated by detect thread)
 model_vote_counters   = {name: 0 for name in MODELS}
 ensemble_alert_counter = 0
 
+def load_past_alerts():
+    """Read existing JSON alerts from log and rebuild counters."""
+    alerts = []
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE) as f:
+            for line in f:
+                try:
+                    alert = json.loads(line)
+                    alerts.append(alert)
+                    # update counters
+                    for m, v in alert.get('votes', {}).items():
+                        model_vote_counters[m] += v
+                except json.JSONDecodeError:
+                    continue
+    # total alerts is simply len(alerts)
+    return alerts
+
+@app.route('/')
+def index():
+    # Load historic alerts & counters
+    past_alerts = load_past_alerts()
+    summary = {
+        'model_votes': model_vote_counters,
+        'total_alerts': len(past_alerts)
+    }
+    return render_template(
+        'index.html',
+        init_alerts=json.dumps(past_alerts),
+        init_summary=json.dumps(summary)
+    )
+
 def detect(queue: Queue):
     global ensemble_alert_counter
-    print("[detect] thread starting…", file=sys.stderr)
-
-    # Get feature columns once (shared by all models)
+    print("[detect] starting…", file=sys.stderr)
     feature_cols = list(next(iter(MODELS.values())).feature_names_in_)
 
     while True:
         msg = queue.get()
         if msg is None:
-            print("[detect] stream ended, emitting summary…", file=sys.stderr)
+            print("[detect] stream ended", file=sys.stderr)
             break
 
-        # Debug log
-        print(f"[detect] got msg time_ms={msg.get('time_ms')}", file=sys.stderr)
-
-        # Drop unwanted keys
+        # drop synthetic fields
         msg.pop('time_ms', None)
         msg.pop('label',   None)
 
-        # Build DataFrame with exactly the trained features
         df = pd.DataFrame([msg], columns=feature_cols)
 
-        # Each model votes
         votes = {}
         for name, clf in MODELS.items():
             pred = int(clf.predict(df)[0])
             votes[name] = pred
             model_vote_counters[name] += pred
 
-        # Ensemble majority
         if sum(votes.values()) >= (len(votes) / 2):
             ensemble_alert_counter += 1
             alert = {
-                'time':   time.strftime("%H:%M:%S"),
+                'time': time.strftime("%H:%M:%S"),
                 'src_ip': msg.get('src_ip', '<unknown>'),
-                'votes':  votes
+                'votes': votes
             }
-            print(f"[detect] emitting alert: {alert}", file=sys.stderr)
+            # emit & log
             socketio.emit('new_alert', alert)
-
-            # Log to file
             os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
             with open(LOG_FILE, 'a') as f:
-                f.write(f"{alert}\n")
+                f.write(json.dumps(alert) + "\n")
 
-    # After the loop, emit the run summary
+    # once stream ends, emit final summary
     summary = {
         'model_votes': model_vote_counters,
         'total_alerts': ensemble_alert_counter
     }
-    print(f"[detect] run summary: {summary}", file=sys.stderr)
     socketio.emit('run_summary', summary)
 
 def simulate(queue: Queue, csv_path: str, delay: float = 0.05):
-    print(f"[simulate] loading CSV from {csv_path}", file=sys.stderr)
+    print(f"[simulate] loading {csv_path}", file=sys.stderr)
     df = pd.read_csv(csv_path)
     for _, row in df.iterrows():
-        print(f"[simulate] enqueue time_ms={row.get('time_ms')}", file=sys.stderr)
         queue.put(row.to_dict())
         time.sleep(delay)
-    print("[simulate] done streaming, sending sentinel", file=sys.stderr)
     queue.put(None)
-
-@app.route('/')
-def index():
-    return render_template('index.html')
 
 if __name__ == "__main__":
     q = Queue()

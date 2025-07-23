@@ -2,35 +2,119 @@
 <html lang="en">
   <head>
     <meta charset="utf-8">
-    <title>Real-Time IoT Alerts</title>
+    <title>IoT Cyber-Range Dashboard</title>
     <script src="//cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.min.js"></script>
     <style>
-      body { font-family: Arial, sans-serif; margin: 1em; }
-      #alerts { margin-top: 1em; }
-      .alert { padding: 0.5em; border-bottom: 1px solid #ddd; }
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 800px;
+        margin: 1em auto;
+        padding: 0 1em;
+      }
+      h1, h2 {
+        text-align: centre;
+      }
+      #summary, #alerts {
+        margin-top: 2em;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 1em;
+      }
+      th, td {
+        padding: 0.5em;
+        border: 1px solid #ccc;
+        text-align: left;
+      }
+      th {
+        background: #f7f7f7;
+      }
+      .alert {
+        background: #ffecec;
+        border: 1px solid #f5aca6;
+        border-radius: 4px;
+        padding: 0.5em;
+        margin-bottom: 0.5em;
+      }
     </style>
   </head>
   <body>
     <h1>Real-Time IoT Alerts</h1>
-    <div id="alerts"></div>
+
+    <section id="summary">
+      <h2>Model Vote Counters</h2>
+      <table id="summary-table">
+        <thead>
+          <tr><th>Model</th><th>Positive Votes</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p><strong>Total Ensemble Alerts:</strong> <span id="total-alerts">0</span></p>
+    </section>
+
+    <section id="alerts">
+      <h2>Alert Feed</h2>
+      <!-- New alerts appear here -->
+    </section>
 
     <script>
-      console.log("Dashboard loaded, connecting to SocketIO…");
+      console.log("Dashboard loaded, connecting…");
       const socket = io();
 
-      socket.on('connect', () => {
-        console.log("Socket connected!");
-      });
-      socket.on('disconnect', () => {
-        console.log("Socket disconnected");
-      });
+      const modelVoteCounters = {};
+      const tbody = document.querySelector('#summary-table tbody');
+      const totalEl = document.getElementById('total-alerts');
+      const alertsEl = document.getElementById('alerts');
+
+      socket.on('connect', () => console.log("Socket connected"));
+      socket.on('disconnect', () => console.log("Socket disconnected"));
 
       socket.on('new_alert', data => {
-        console.log("Received new_alert:", data);
+        console.log("Received alert:", data);
+
+        // Update model vote counts
+        Object.entries(data.votes).forEach(([model, vote]) => {
+          if (!(model in modelVoteCounters)) {
+            modelVoteCounters[model] = 0;
+          }
+          modelVoteCounters[model] += vote;
+
+          let row = document.getElementById('row-' + model);
+          if (!row) {
+            row = document.createElement('tr');
+            row.id = 'row-' + model;
+            row.innerHTML = `<td>${model}</td><td id="cell-${model}">0</td>`;
+            tbody.appendChild(row);
+          }
+          document.getElementById('cell-' + model).textContent = modelVoteCounters[model];
+        });
+
+        // Update total alerts
+        totalEl.textContent = parseInt(totalEl.textContent) + 1;
+
+        // Prepend to alert feed
         const div = document.createElement('div');
         div.className = 'alert';
-        div.textContent = `${data.time} ALERT from ${data.src_ip} (votes: ${JSON.stringify(data.votes)})`;
-        document.getElementById('alerts').prepend(div);
+        div.textContent = `${data.time} – ALERT from ${data.src_ip} (votes: ${JSON.stringify(data.votes)})`;
+        alertsEl.prepend(div);
+      });
+
+      socket.on('run_summary', summary => {
+        console.log("Run completed:", summary);
+        // Populate summary table with final counts
+        Object.entries(summary.model_votes).forEach(([model, count]) => {
+          let row = document.getElementById('row-' + model);
+          if (!row) {
+            row = document.createElement('tr');
+            row.id = 'row-' + model;
+            row.innerHTML = `<td>${model}</td><td id="cell-${model}">${count}</td>`;
+            tbody.appendChild(row);
+          } else {
+            document.getElementById('cell-' + model).textContent = count;
+          }
+        });
+        totalEl.textContent = summary.total_alerts;
       });
     </script>
   </body>

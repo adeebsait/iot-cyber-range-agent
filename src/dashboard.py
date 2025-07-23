@@ -15,15 +15,15 @@ DATA_STREAM  = os.path.join(ROOT, 'data', 'stream.csv')
 MODEL_DIR    = os.path.join(ROOT, 'models')
 LOG_FILE     = os.path.join(ROOT, 'logs', 'alerts.log')
 
-# Ensure logs folder and clear the old log
+# Clear previous log
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-with open(LOG_FILE, 'w'): pass
+open(LOG_FILE, 'w').close()
 
-# ─── FLASK / SOCKET.IO SETUP ─────────────────────────────────────────────────────
+# ─── FLASK / SOCKET.IO ────────────────────────────────────────────────────────────
 app = Flask(__name__, template_folder=TEMPLATE_DIR)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# ─── LOAD YOUR MODELS ─────────────────────────────────────────────────────────────
+# ─── LOAD MODELS ──────────────────────────────────────────────────────────────────
 MODELS = {
     "RF":       joblib.load(os.path.join(MODEL_DIR, "Random_Forest.pkl")),
     "KNN":      joblib.load(os.path.join(MODEL_DIR, "KNN_(k=5).pkl")),
@@ -35,7 +35,7 @@ MODELS = {
 model_vote_counters   = {name: 0 for name in MODELS}
 ensemble_alert_counter = 0
 
-# ─── UTIL: read existing log into memory ─────────────────────────────────────────
+# ─── UTIL: read existing log ──────────────────────────────────────────────────────
 def load_past_alerts():
     alerts = []
     if os.path.exists(LOG_FILE):
@@ -50,7 +50,7 @@ def load_past_alerts():
                     continue
     return alerts
 
-# ─── ROUTE: dashboard page ────────────────────────────────────────────────────────
+# ─── ROUTE: main page ─────────────────────────────────────────────────────────────
 @app.route('/')
 def index():
     past_alerts = load_past_alerts()
@@ -58,14 +58,13 @@ def index():
         'model_votes': model_vote_counters,
         'total_alerts': len(past_alerts)
     }
-    # We embed these straight as JS arrays/objects
     return render_template(
         'index.html',
         init_alerts  = json.dumps(past_alerts),
         init_summary = json.dumps(summary)
     )
 
-# ─── WORKER: detect & write to log + immediate emit ─────────────────────────────
+# ─── WORKER: detection ─────────────────────────────────────────────────────────────
 def detect(queue: Queue):
     global ensemble_alert_counter
     feature_cols = list(next(iter(MODELS.values())).feature_names_in_)
@@ -73,43 +72,41 @@ def detect(queue: Queue):
     while True:
         msg = queue.get()
         if msg is None:
-            # signal end of stream
-            socketio.emit('run_summary', {
-              'model_votes': model_vote_counters,
-              'total_alerts': ensemble_alert_counter
-            })
+            # end-of-stream summary
+            socketio.emit(
+                'run_summary',
+                {'model_votes': model_vote_counters,
+                 'total_alerts': ensemble_alert_counter},
+                broadcast=True
+            )
             break
 
-        # Drop synthetic keys
+        # drop synthetic keys
         msg.pop('time_ms', None)
         msg.pop('label',   None)
 
-        # Build row for prediction
         from pandas import DataFrame
         df = DataFrame([msg], columns=feature_cols)
 
-        # Each model votes
         votes = {}
         for name, clf in MODELS.items():
             pred = int(clf.predict(df)[0])
             votes[name] = pred
             model_vote_counters[name] += pred
 
-        # Majority → ALERT
         if sum(votes.values()) >= (len(votes)/2):
             ensemble_alert_counter += 1
             alert = {
                 'time':   time.strftime("%H:%M:%S"),
-                'src_ip': msg.get('src_ip', '<unknown>'),
+                'src_ip': msg.get('src_ip','<unknown>'),
                 'votes':  votes
             }
-            # 1) immediate push
-            socketio.emit('new_alert', alert)
-            # 2) append to log
+            # immediate broadcast + log
+            socketio.emit('new_alert', alert, broadcast=True)
             with open(LOG_FILE, 'a') as f:
                 f.write(json.dumps(alert) + "\n")
 
-# ─── WORKER: tail the log file and emit any new lines (in case of any lag) ──────
+# ─── WORKER: tail the log ──────────────────────────────────────────────────────────
 def tail_log():
     with open(LOG_FILE, 'r') as f:
         f.seek(0, os.SEEK_END)
@@ -122,10 +119,9 @@ def tail_log():
                 alert = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            # emit (counters already updated by detect)
-            socketio.emit('new_alert', alert)
+            socketio.emit('new_alert', alert, broadcast=True)
 
-# ─── WORKER: simulate CSV rows one-by-one ────────────────────────────────────────
+# ─── WORKER: simulator ────────────────────────────────────────────────────────────
 def simulate(queue: Queue, csv_path: str, delay: float = 0.05):
     with open(csv_path, newline='') as csvfile:
         reader = csv.DictReader(csvfile)

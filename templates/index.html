@@ -30,22 +30,20 @@
   </section>
 
   <script>
-    // initial state embedded by Flask
     const initAlerts  = {{ init_alerts  | safe }};
     const initSummary = {{ init_summary | safe }};
     const summaryBody = document.getElementById('summary-body');
     const totalEl     = document.getElementById('total-alerts');
     const alertsEl    = document.getElementById('alerts');
 
-    // populate summary
-    for (const [model, count] of Object.entries(initSummary.model_votes)) {
+    // Populate initial counters & feed
+    for (const [m,c] of Object.entries(initSummary.model_votes)) {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${model}</td><td id="count-${model}">${count}</td>`;
+      tr.innerHTML = `<td>${m}</td><td id="count-${m}">${c}</td>`;
       summaryBody.appendChild(tr);
     }
     totalEl.textContent = initSummary.total_alerts;
 
-    // populate past alerts
     initAlerts.forEach(alert => {
       const div = document.createElement('div');
       div.className = 'alert';
@@ -54,18 +52,14 @@
       alertsEl.appendChild(div);
     });
 
-    // connect SocketIO
+    // Real-time socket updates
     const socket = io();
-
     socket.on('new_alert', data => {
-      // update counters
-      for (const [model, vote] of Object.entries(data.votes)) {
-        const cell = document.getElementById(`count-${model}`);
-        cell.textContent = parseInt(cell.textContent) + vote;
+      for (const [m,v] of Object.entries(data.votes)) {
+        const cell = document.getElementById(`count-${m}`);
+        cell.textContent = parseInt(cell.textContent) + v;
       }
       totalEl.textContent = parseInt(totalEl.textContent) + 1;
-
-      // prepend new alert
       const div = document.createElement('div');
       div.className = 'alert';
       div.textContent = `${data.time} – ALERT from ${data.src_ip}
@@ -74,9 +68,8 @@
     });
 
     socket.on('run_summary', summary => {
-      // finalise if needed
-      for (const [model, count] of Object.entries(summary.model_votes)) {
-        document.getElementById(`count-${model}`).textContent = count;
+      for (const [m,c] of Object.entries(summary.model_votes)) {
+        document.getElementById(`count-${m}`).textContent = c;
       }
       totalEl.textContent = summary.total_alerts;
     });

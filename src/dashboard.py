@@ -7,19 +7,16 @@ from queue import Queue
 from threading import Thread
 from flask import Flask, render_template
 from flask_socketio import SocketIO
+from pandas import DataFrame
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────────
 ROOT         = os.path.dirname(os.path.dirname(__file__))
 TEMPLATE_DIR = os.path.join(ROOT, 'templates')
-DATA_DIR     = os.path.join(ROOT, 'data', 'ICUDatasetProcessed')
-DATA_STREAM  = os.path.join(ROOT, 'data', 'stream.csv')
+STREAM_CSV   = os.path.join(ROOT, 'data', 'stream.csv')
 MODEL_DIR    = os.path.join(ROOT, 'models')
 LOG_FILE     = os.path.join(ROOT, 'logs', 'alerts.log')
 
-STREAM_LENGTH      = 200    # total rows to simulate
-ATTACK_OVERSAMPLE  = 0.6    # proportion of attacks in the stream
-
-# Ensure log folder & clear prior log
+# Clear previous run’s log
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 open(LOG_FILE, 'w').close()
 
@@ -27,7 +24,7 @@ open(LOG_FILE, 'w').close()
 app = Flask(__name__, template_folder=TEMPLATE_DIR)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# ─── LOAD TRAINED MODELS ─────────────────────────────────────────────────────────
+# ─── LOAD MODELS ──────────────────────────────────────────────────────────────────
 MODELS = {
     "RF":       joblib.load(os.path.join(MODEL_DIR, "Random_Forest.pkl")),
     "KNN":      joblib.load(os.path.join(MODEL_DIR, "KNN_(k=5).pkl")),
@@ -38,79 +35,53 @@ MODELS = {
 }
 
 # ─── METRIC COUNTERS ──────────────────────────────────────────────────────────────
-model_vote_counters   = {m: 0 for m in MODELS}   # total positive votes
-model_tp_counters     = {m: 0 for m in MODELS}   # true positives
+model_vote_counters   = {m: 0 for m in MODELS}
+model_tp_counters     = {m: 0 for m in MODELS}
 total_attacks         = 0
 ensemble_alerts       = 0
 
-# ─── UTIL: build a “complex” short stream ────────────────────────────────────────
-def make_stream():
-    import pandas as pd
-    # Load the three raw files
-    df_attack = pd.read_csv(os.path.join(DATA_DIR, "Attack.csv"), low_memory=False)
-    df_env    = pd.read_csv(os.path.join(DATA_DIR, "environmentMonitoring.csv"), low_memory=False)
-    df_pat    = pd.read_csv(os.path.join(DATA_DIR, "patientMonitoring.csv"), low_memory=False)
-
-    # Label them
-    df_attack['label'] = 1
-    df_env   ['label'] = 0
-    df_pat   ['label'] = 0
-
-    # Oversample attacks for harder detection
-    n_att = int(STREAM_LENGTH * ATTACK_OVERSAMPLE)
-    n_ben = STREAM_LENGTH - n_att
-    samp_attack = df_attack.sample(n=min(n_att, len(df_attack)), random_state=42)
-    samp_ben    = pd.concat([
-        df_env.sample(n=n_ben//2, random_state=1),
-        df_pat.sample(n=n_ben - n_ben//2, random_state=2)
-    ])
-
-    stream = pd.concat([samp_attack, samp_ben]).sample(frac=1, random_state=42).reset_index(drop=True)
-    # Add simple time_ms
-    stream.insert(0, 'time_ms', stream.index * 50)
-    stream.to_csv(DATA_STREAM, index=False)
-    return list(csv.DictReader(open(DATA_STREAM)))
-
-# ─── UTIL: load previous alerts for refresh ───────────────────────────────────────
+# ─── UTIL: read existing log for page reloads ─────────────────────────────────────
 def load_past_alerts():
     alerts = []
     if os.path.exists(LOG_FILE):
-        for line in open(LOG_FILE):
-            try:
-                alerts.append(json.loads(line))
-            except:
-                pass
+        with open(LOG_FILE) as f:
+            for line in f:
+                try:
+                    alerts.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
     return alerts
 
 # ─── ROUTE: serve dashboard ───────────────────────────────────────────────────────
 @app.route('/')
 def index():
-    past = load_past_alerts()
-    # build summary
-    init_summary = {
-        'model_votes': model_vote_counters,
+    past_alerts = load_past_alerts()
+    summary = {
+        'model_votes':     model_vote_counters,
         'detection_rates': {
             m: round((model_tp_counters[m] / total_attacks * 100) if total_attacks else 0, 2)
             for m in MODELS
         },
         'ensemble_alerts': ensemble_alerts,
-        'total_attacks': total_attacks
+        'total_attacks':   total_attacks
     }
     return render_template(
         'index.html',
-        init_alerts  = json.dumps(past),
-        init_summary = json.dumps(init_summary)
+        init_alerts  = json.dumps(past_alerts),
+        init_summary = json.dumps(summary)
     )
 
 # ─── WORKER: detect & log ─────────────────────────────────────────────────────────
-def detect(queue: Queue):
+def detect(q: Queue):
     global total_attacks, ensemble_alerts
+
+    # Pre-fetch feature names
     feature_cols = list(next(iter(MODELS.values())).feature_names_in_)
 
     while True:
-        msg = queue.get()
+        msg = q.get()
         if msg is None:
-            # end-of-run summary
+            # emit final detection summary
             summary = {
                 'detection_rates': {
                     m: round((model_tp_counters[m] / total_attacks * 100) if total_attacks else 0, 2)
@@ -122,19 +93,18 @@ def detect(queue: Queue):
             socketio.emit('detection_summary', summary)
             break
 
-        # preserve label before popping
+        # record label for TP counting
         label = int(msg.get('label', 0))
         if label == 1:
             total_attacks += 1
 
-        # strip synthetic fields
+        # drop synthetic fields
         msg.pop('time_ms', None)
 
         # build DataFrame
-        from pandas import DataFrame
-        df = DataFrame([msg])[feature_cols]
+        df = DataFrame([msg], columns=feature_cols)
 
-        # each model votes
+        # model votes + TP count
         votes = {}
         for name, clf in MODELS.items():
             pred = int(clf.predict(df)[0])
@@ -143,24 +113,26 @@ def detect(queue: Queue):
             if label == 1 and pred == 1:
                 model_tp_counters[name] += 1
 
-        # ensemble majority
+        # ensemble majority decision
         if sum(votes.values()) >= (len(votes)/2):
             ensemble_alerts += 1
             alert = {
                 'time':   time.strftime("%H:%M:%S"),
-                'src_ip': msg.get('src_ip','<unknown>'),
+                'src_ip': msg.get('src_ip', '<unknown>'),
                 'votes':  votes
             }
             socketio.emit('new_alert', alert)
             with open(LOG_FILE, 'a') as f:
                 f.write(json.dumps(alert) + "\n")
 
-# ─── WORKER: simulate the shortened complex stream ─────────────────────────────────
-def simulate(queue: Queue):
-    for row in make_stream():
-        queue.put(row)
-        time.sleep(0.05)
-    queue.put(None)
+# ─── WORKER: read the updated stream.csv ────────────────────────────────────────────
+def simulate(q: Queue):
+    with open(STREAM_CSV, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            q.put(row)
+            time.sleep(int(row.get('time_ms', 50)) / 1000.0)
+    q.put(None)
 
 # ─── ENTRY POINT ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

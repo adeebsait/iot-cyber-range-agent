@@ -3,6 +3,7 @@ import time
 import json
 import joblib
 import csv
+import datetime
 from queue import Queue
 from threading import Thread
 from flask import Flask, render_template
@@ -14,10 +15,11 @@ ROOT         = os.path.dirname(os.path.dirname(__file__))
 TEMPLATE_DIR = os.path.join(ROOT, 'templates')
 STREAM_CSV   = os.path.join(ROOT, 'data', 'stream.csv')
 MODEL_DIR    = os.path.join(ROOT, 'models')
-LOG_FILE     = os.path.join(ROOT, 'logs', 'alerts.log')
+LOG_DIR      = os.path.join(ROOT, 'logs')
+LOG_FILE     = os.path.join(LOG_DIR, 'alerts.log')
 
 # Clear previous run’s log
-os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
 open(LOG_FILE, 'w').close()
 
 # ─── FLASK & SOCKET.IO SETUP ─────────────────────────────────────────────────────
@@ -52,6 +54,32 @@ def load_past_alerts():
                     continue
     return alerts
 
+# ─── UTIL: generate end-of-run report ─────────────────────────────────────────────
+def generate_report():
+    # summary
+    detection_rates = {
+        m: round((model_tp_counters[m] / total_attacks * 100) if total_attacks else 0, 2)
+        for m in MODELS
+    }
+    summary = {
+        'model_votes': model_vote_counters,
+        'detection_rates': detection_rates,
+        'ensemble_alerts': ensemble_alerts,
+        'total_attacks': total_attacks
+    }
+    # load logs
+    logs = load_past_alerts()
+
+    report = {
+        'generated_at': datetime.datetime.now().isoformat(),
+        'summary': summary,
+        'alerts': logs
+    }
+    filename = os.path.join(LOG_DIR, f"report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    with open(filename, 'w') as f:
+        json.dump(report, f, indent=2)
+    print(f"Report written to {filename}")
+
 # ─── ROUTE: serve dashboard ───────────────────────────────────────────────────────
 @app.route('/')
 def index():
@@ -81,30 +109,35 @@ def detect(q: Queue):
     while True:
         msg = q.get()
         if msg is None:
-            # emit final detection summary
-            summary = {
+            # final summary to UI
+            socketio.emit('detection_summary', {
                 'detection_rates': {
                     m: round((model_tp_counters[m] / total_attacks * 100) if total_attacks else 0, 2)
                     for m in MODELS
                 },
                 'ensemble_alerts': ensemble_alerts,
                 'total_attacks': total_attacks
-            }
-            socketio.emit('detection_summary', summary)
+            })
+            # generate report file
+            generate_report()
             break
 
-        # record label for TP counting
-        label = int(msg.get('label', 0))
+        # robust label parsing
+        raw = msg.get('label', 0)
+        try:
+            label = int(raw)
+        except (ValueError, TypeError):
+            try:
+                label = int(float(raw))
+            except Exception:
+                label = 0
+
         if label == 1:
             total_attacks += 1
 
-        # drop synthetic fields
         msg.pop('time_ms', None)
-
-        # build DataFrame
         df = DataFrame([msg], columns=feature_cols)
 
-        # model votes + TP count
         votes = {}
         for name, clf in MODELS.items():
             pred = int(clf.predict(df)[0])
@@ -113,8 +146,7 @@ def detect(q: Queue):
             if label == 1 and pred == 1:
                 model_tp_counters[name] += 1
 
-        # ensemble majority decision
-        if sum(votes.values()) >= (len(votes)/2):
+        if sum(votes.values()) >= (len(votes) / 2):
             ensemble_alerts += 1
             alert = {
                 'time':   time.strftime("%H:%M:%S"),
@@ -125,13 +157,27 @@ def detect(q: Queue):
             with open(LOG_FILE, 'a') as f:
                 f.write(json.dumps(alert) + "\n")
 
-# ─── WORKER: read the updated stream.csv ────────────────────────────────────────────
+# ─── WORKER: read the updated stream.csv & emit time remaining ───────────────────
 def simulate(q: Queue):
+    # calculate total time
+    total_ms = 0
     with open(STREAM_CSV, newline='') as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
+            total_ms += int(row.get('time_ms', 50))
+
+    remaining_ms = total_ms
+
+    with open(STREAM_CSV, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            ms = int(row.get('time_ms', 50))
             q.put(row)
-            time.sleep(int(row.get('time_ms', 50)) / 1000.0)
+            time.sleep(ms / 1000.0)
+            remaining_ms -= ms
+            # emit estimated time remaining
+            socketio.emit('time_remaining', {'seconds': round(remaining_ms / 1000, 2)})
+
     q.put(None)
 
 # ─── ENTRY POINT ──────────────────────────────────────────────────────────────────
